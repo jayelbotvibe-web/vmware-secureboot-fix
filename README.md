@@ -1,126 +1,132 @@
-# VMware Kernel Module Auto-Fix
+# Fix VMware "Virtual Machine Monitor Failed" After Ubuntu Kernel Update
 
-**Never manually fix VMware after a kernel update again.**
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Ubuntu%20%7C%20Debian-orange)]()
 
-Works on any Debian/Ubuntu system — Secure Boot or not. The hook detects your environment and does the right thing.
+**The one-click fix for the most annoying VMware-on-Linux problem.**
 
-## What it does
+If you see this after a kernel update:
 
-| Step | With Secure Boot | Without Secure Boot |
-|------|-----------------|---------------------|
-| 1 | Recompiles `vmmon` + `vmnet` for new kernel | Same |
-| 2 | Signs modules with your MOK key | Skipped |
-| 3 | Verifies signatures took effect | Skipped |
-| 4 | Enables `vmware.service` (auto-start on boot) | Same |
-| 5 | Clears stale "failed" state | Same |
+```
+$ systemctl status vmware
+× vmware.service - LSB: This service starts and stops VMware services
+   Virtual machine monitor - failed
+   Virtual ethernet - failed
 
-## Quick Start
+$ dmesg | grep module
+Loading of unsigned module is rejected
+Loading of unsigned module is rejected
+```
 
-### 1. Generate MOK keys (Secure Boot users only)
+**This repo fixes it permanently.** One install, zero future intervention — works with or without Secure Boot.
 
-Skip this if Secure Boot is disabled on your system. Check with `mokutil --sb-state`.
+---
+
+## The Problem
+
+Every time Ubuntu pushes a kernel update, VMware Workstation / Player breaks. The `vmmon` and `vmnet` kernel modules need to be recompiled for the new kernel, and if Secure Boot is enabled, they must be signed with a Machine Owner Key (MOK) or the kernel rejects them as "unsigned."
+
+Existing fixes are manual, fragile, or target the wrong kernel version. This hook fixes all three root-cause bugs.
+
+## The Fix
 
 ```bash
+git clone https://github.com/jayelbotvibe-web/vmware-secureboot-fix.git
+cd vmware-secureboot-fix
+
+# Secure Boot users only — generate + enroll a MOK key (one-time):
 sudo mkdir -p /root/.vmware-keys
 sudo openssl req -new -x509 -newkey rsa:2048 \
   -keyout /root/.vmware-keys/MOK.priv \
   -outform DER -out /root/.vmware-keys/MOK.der \
   -nodes -days 36500 -subj "/CN=VMware-MOK"
 sudo mokutil --import /root/.vmware-keys/MOK.der
-# Reboot, select "Enroll MOK" in the blue MOK Manager screen, then continue:
-```
+# Reboot → select "Enroll MOK" in the blue screen → reboot again
 
-### 2. Install the hook
-
-```bash
+# Install the hook (works for everyone):
 sudo cp vmware-sign-modules /etc/kernel/postinst.d/vmware-sign-modules
 sudo chmod +x /etc/kernel/postinst.d/vmware-sign-modules
-```
 
-### 3. Run it once for the current kernel (optional)
-
-```bash
-sudo /etc/kernel/postinst.d/vmware-sign-modules $(uname -r)
-```
-
-Done. Next kernel update will be handled automatically.
-
-## Configuration
-
-Set these environment variables before the hook runs — either at the top of the hook file, or in `/etc/default/vmware-sign-modules`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MOK_PRIV_DIR` | `/root/.vmware-keys` | Path to MOK key directory |
-| `LOG_FILE` | `/var/log/vmware-hook.log` | Log file location |
-| `MAX_RETRIES` | `3` | Retry attempts for headers/signing |
-| `RETRY_DELAY` | `30` | Seconds between retries |
-
-Example for custom key location:
-```bash
-sudo mkdir -p /etc/default
-echo 'MOK_PRIV_DIR=/etc/vmware-keys' | sudo tee /etc/default/vmware-sign-modules
-```
-
-## Manual Quick-Fix
-
-If VMware is currently broken and you want to fix it right now:
-
-```bash
+# Fix current kernel right now (optional):
 sudo ./fix-vmware.sh
 ```
 
-Or for custom key location:
+**That's it.** Next kernel update: VMware works after reboot. No terminal, no googling, no `vmware-modconfig`.
+
+---
+
+## What It Actually Does
+
+| Step | Secure Boot ON | Secure Boot OFF |
+|------|:---:|:---:|
+| Detects environment | ✅ `mokutil --sb-state` | ✅ |
+| Recompiles `vmmon` + `vmnet` | ✅ `vmware-modconfig` | ✅ |
+| Signs modules with MOK key | ✅ `sign-file` | ⏭️ Skipped |
+| Verifies signatures took effect | ✅ `modinfo -F sig_id` | ⏭️ Skipped |
+| Enables `vmware.service` | ✅ `systemctl enable` | ✅ |
+| Clears stale "failed" state | ✅ `systemctl reset-failed` | ✅ |
+
+---
+
+## The Three Bugs This Fixes
+
+Why do existing approaches fail? Three compounding issues:
+
+### 🐛 Bug 1: Signing the wrong kernel's modules
+
+Kernel hooks run during package installation, *before reboot*. The common signing approach:
+
 ```bash
-sudo MOK_PRIV_DIR=/custom/path ./fix-vmware.sh
+VMMON=$(modinfo -n vmmon)   # Returns OLD kernel's module path
+sign-file ... "$VMMON"       # Signs the wrong file
 ```
 
-## Root Cause: Why This Problem Exists
+`modinfo -n` queries the **currently running** kernel. Since the system hasn't rebooted, that's the old kernel. The correct, newly-compiled modules for the new kernel are never signed.
 
-Three compounding bugs break VMware after every kernel update on Secure Boot systems:
+**Our fix**: targets `/lib/modules/${KERNEL_VERSION}/misc/` explicitly.
 
-### Bug 1: Wrong-Target Signing
+### 🐛 Bug 2: Disabled service
 
-Kernel hooks run during `dpkg --configure`, *before* reboot. The typical sign attempt uses:
+`vmware.service` defaults to `disabled`. Systemd won't auto-start a disabled service after reboot, even with perfectly signed modules.
 
-```bash
-VMMON=$(modinfo -n vmmon)      # ← BUG: returns OLD kernel's module path!
-```
+**Our fix**: `systemctl enable vmware` in the hook.
 
-`modinfo -n` queries the currently running kernel. Since we haven't rebooted yet, that's still the **old** kernel. The hook signs old modules while `vmware-modconfig` compiles new, unsigned ones.
+### 🐛 Bug 3: Persisted failed state
 
-### Bug 2: Disabled Service
+`vmware-modconfig` tries to start the service during compilation. New modules can't load into the old kernel → service fails → systemd marks it `failed`. That state persists across reboots and prevents auto-start.
 
-`vmware.service` is often `disabled`. Systemd won't auto-start a disabled service after reboot, even if modules are ready.
+**Our fix**: `systemctl reset-failed vmware` to clear the stale state.
 
-### Bug 3: Persisted Failed State
+---
 
-`vmware-modconfig` tries to start the service during compilation. The new modules can't load into the old kernel, so it fails. Systemd marks it `failed` — that state persists across reboots, and a failed service won't auto-start.
+## Configuration
 
-### Why Signing Can Silently Fail
+Set in `/etc/default/vmware-sign-modules` or at the top of the hook file:
 
-Even when logs show `vmmon signed OK`, the signature may not take. This happens when:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MOK_PRIV_DIR` | `/root/.vmware-keys` | Where your MOK keypair lives |
+| `LOG_FILE` | `/var/log/vmware-hook.log` | Hook log location |
+| `MAX_RETRIES` | `3` | Retries for headers/signing |
+| `RETRY_DELAY` | `30` | Seconds between retries |
 
-- `vmware-modconfig` overwrites the modules after signing
-- The sign tool succeeds on a temp file but the module at the final path isn't updated
-
-**This hook verifies with `modinfo -F sig_id` and exits with error if the signature didn't stick.**
+---
 
 ## Compatibility
 
-- **VMware Workstation / Player** 17+ (older versions may work)
-- **Debian / Ubuntu** (any distro with `/etc/kernel/postinst.d/`)
-- **Secure Boot** on or off — auto-detected
+- **VMware Workstation 17+ / Player 17+**
+- **Ubuntu 22.04+ / Debian 12+** (any distro with `/etc/kernel/postinst.d/`)
+- **Secure Boot** on or off — auto-detected, no config needed
 - **Any kernel version**
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `vmware-sign-modules` | Kernel post-install hook |
-| `fix-vmware.sh` | Manual one-shot fix |
-| `README.md` | This document |
+| `vmware-sign-modules` | Kernel post-install hook (the auto-fix) |
+| `fix-vmware.sh` | Manual one-shot fix for right now |
+| `README.md` | You're reading it |
 
 ## License
 
-MIT
+MIT — use it, fork it, ship it.
