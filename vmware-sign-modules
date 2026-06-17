@@ -1,25 +1,27 @@
 #!/bin/bash
 # ============================================================
-# VMware Kernel Module Auto-Fix for Secure Boot
+# VMware Kernel Module Auto-Fix
 # ============================================================
 # Installs as: /etc/kernel/postinst.d/vmware-sign-modules
-# Runs automatically after every kernel update
+# Runs automatically after every kernel update on Debian/Ubuntu
 #
-# WHAT THIS SOLVES:
-#   1. Compiles vmmon/vmnet for the NEW kernel
-#   2. Signs them for Secure Boot (MOK key)
-#   3. Verifies signatures actually took effect
-#   4. Ensures vmware.service auto-starts on next boot
-#   5. Clears the failed state left by vmware-modconfig
+# Config via environment variables (set in the hook file itself,
+# or in /etc/default/vmware-sign-modules):
+#   MOK_PRIV_DIR  — path to MOK key directory (default: /root/.vmware-keys)
+#   LOG_FILE      — log location (default: /var/log/vmware-hook.log)
+#   MAX_RETRIES   — retry attempts for headers/signing (default: 3)
+#   RETRY_DELAY   — seconds between retries (default: 30)
 
 set -euo pipefail
 
+# ── Configuration ────────────────────────────────────────────
 KERNEL_VERSION="${1:-}"
-MOK_PRIV="/home/niel/.vmware-keys/MOK.priv"
-MOK_DER="/home/niel/.vmware-keys/MOK.der"
-LOG="/var/log/vmware-hook.log"
-MAX_RETRIES=3
-RETRY_DELAY=30
+MOK_PRIV_DIR="${MOK_PRIV_DIR:-/root/.vmware-keys}"
+MOK_PRIV="${MOK_PRIV_DIR}/MOK.priv"
+MOK_DER="${MOK_PRIV_DIR}/MOK.der"
+LOG="${LOG_FILE:-/var/log/vmware-hook.log}"
+MAX_RETRIES="${MAX_RETRIES:-3}"
+RETRY_DELAY="${RETRY_DELAY:-30}"
 
 log() { echo "[$(date)] $*" | tee -a "$LOG"; }
 
@@ -29,11 +31,25 @@ if [[ -z "$KERNEL_VERSION" ]]; then
     exit 1
 fi
 
+if [[ ! -f /usr/bin/vmware-modconfig ]]; then
+    log "VMware not installed. Nothing to do."
+    exit 0
+fi
+
 HEADER_DIR="/lib/modules/${KERNEL_VERSION}/build"
 SIGN_TOOL="${HEADER_DIR}/scripts/sign-file"
 
+# ── Detect Secure Boot ──────────────────────────────────────
+SECURE_BOOT=0
+if command -v mokutil &>/dev/null; then
+    if mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
+        SECURE_BOOT=1
+    fi
+fi
+
 log "========================================"
 log "Kernel ${KERNEL_VERSION} — building VMware modules"
+log "Secure Boot: $([ $SECURE_BOOT -eq 1 ] && echo 'ENABLED' || echo 'disabled — skipping signing')"
 log "========================================"
 
 # ── Step 1: Wait for kernel headers ─────────────────────────
@@ -51,79 +67,83 @@ for i in $(seq 1 $MAX_RETRIES); do
 done
 
 # ── Step 2: Compile modules ─────────────────────────────────
-# NOTE: vmware-modconfig will try to start/stop the service
-# and FAIL — this is EXPECTED because we're still on the OLD kernel.
-# The modules get compiled regardless.
+# vmware-modconfig tries to start the service — this FAILS
+# because we're still on the OLD kernel. Expected and harmless.
 log "Compiling modules..."
 if vmware-modconfig --console --install-all >> "$LOG" 2>&1; then
     log "Compilation OK"
 else
-    log "Compilation had warnings (service start failed on old kernel — expected)"
+    log "Compilation had warnings (service start on old kernel failed — expected)"
 fi
 
-# ── Step 3: Sign modules for Secure Boot ────────────────────
-for attempt in $(seq 1 $MAX_RETRIES); do
-    log "Signing attempt $attempt of $MAX_RETRIES..."
-
-    if [[ ! -f "$SIGN_TOOL" ]]; then
-        if [[ $attempt -lt $MAX_RETRIES ]]; then
-            log "sign-file not ready. Waiting ${RETRY_DELAY}s..."
-            sleep "$RETRY_DELAY"
-            continue
-        fi
-        log "ERROR: sign-file not found at $SIGN_TOOL"
-        exit 1
-    fi
-
+# ── Step 3: Sign modules (Secure Boot only) ─────────────────
+if [[ $SECURE_BOOT -eq 1 ]]; then
     if [[ ! -f "$MOK_PRIV" || ! -f "$MOK_DER" ]]; then
-        log "ERROR: MOK keys missing at /home/niel/.vmware-keys/"
+        log "ERROR: Secure Boot is ON but no MOK keys at ${MOK_PRIV_DIR}/"
+        log "Generate keys: sudo openssl req -new -x509 -newkey rsa:2048 \\"
+        log "  -keyout ${MOK_PRIV} -outform DER -out ${MOK_DER} -nodes -days 36500 \\"
+        log "  -subj '/CN=VMware-MOK'"
+        log "Then enroll: sudo mokutil --import ${MOK_DER} && reboot"
         exit 1
     fi
 
-    MOD_DIR="/lib/modules/${KERNEL_VERSION}/misc"
-    VMMON="${MOD_DIR}/vmmon.ko"
-    VMNET="${MOD_DIR}/vmnet.ko"
+    for attempt in $(seq 1 $MAX_RETRIES); do
+        log "Signing attempt $attempt of $MAX_RETRIES..."
 
-    all_ok=true
-
-    for mod in "$VMMON" "$VMNET"; do
-        modname=$(basename "$mod" .ko)
-        if [[ -f "$mod" ]]; then
-            if "$SIGN_TOOL" sha256 "$MOK_PRIV" "$MOK_DER" "$mod" >> "$LOG" 2>&1; then
-                log "  ${modname} signed OK"
-            else
-                log "  ${modname} signing FAILED"
-                all_ok=false
+        if [[ ! -f "$SIGN_TOOL" ]]; then
+            if [[ $attempt -lt $MAX_RETRIES ]]; then
+                log "sign-file not ready. Waiting ${RETRY_DELAY}s..."
+                sleep "$RETRY_DELAY"
+                continue
             fi
-        else
-            log "  ${modname} not found at $mod"
-            all_ok=false
-        fi
-    done
-
-    if $all_ok; then
-        log "All modules signed (attempt $attempt)"
-        break
-    elif [[ $attempt -eq $MAX_RETRIES ]]; then
-        log "ERROR: Signing failed after $MAX_RETRIES attempts"
-        exit 1
-    fi
-    sleep "$RETRY_DELAY"
-done
-
-# ── Step 4: VERIFY signatures actually took effect ──────────
-log "Verifying signatures..."
-for mod in "$VMMON" "$VMNET"; do
-    if [[ -f "$mod" ]]; then
-        sig=$(modinfo -F sig_id "$mod" 2>/dev/null)
-        if [[ -n "$sig" ]]; then
-            log "  $(basename $mod): signed ($sig)"
-        else
-            log "  $(basename $mod): STILL UNSIGNED! Signing failed silently."
+            log "ERROR: sign-file not found at $SIGN_TOOL"
             exit 1
         fi
-    fi
-done
+
+        MOD_DIR="/lib/modules/${KERNEL_VERSION}/misc"
+        all_ok=true
+
+        for mod in "${MOD_DIR}/vmmon.ko" "${MOD_DIR}/vmnet.ko"; do
+            modname=$(basename "$mod" .ko)
+            if [[ -f "$mod" ]]; then
+                if "$SIGN_TOOL" sha256 "$MOK_PRIV" "$MOK_DER" "$mod" >> "$LOG" 2>&1; then
+                    log "  ${modname} signed OK"
+                else
+                    log "  ${modname} signing FAILED"
+                    all_ok=false
+                fi
+            else
+                log "  ${modname} not found at $mod"
+                all_ok=false
+            fi
+        done
+
+        if $all_ok; then
+            log "All modules signed (attempt $attempt)"
+            break
+        elif [[ $attempt -eq $MAX_RETRIES ]]; then
+            log "ERROR: Signing failed after $MAX_RETRIES attempts"
+            exit 1
+        fi
+        sleep "$RETRY_DELAY"
+    done
+
+    # ── Step 4: VERIFY signatures actually took effect ──────
+    log "Verifying signatures..."
+    for mod in "${MOD_DIR}/vmmon.ko" "${MOD_DIR}/vmnet.ko"; do
+        if [[ -f "$mod" ]]; then
+            sig=$(modinfo -F sig_id "$mod" 2>/dev/null)
+            if [[ -n "$sig" ]]; then
+                log "  $(basename $mod): signed ($sig)"
+            else
+                log "  $(basename $mod): STILL UNSIGNED! Signing failed silently."
+                exit 1
+            fi
+        fi
+    done
+else
+    log "Secure Boot disabled — skipping module signing"
+fi
 
 # ── Step 5: Update module dependencies ──────────────────────
 depmod "$KERNEL_VERSION" >> "$LOG" 2>&1 && log "depmod OK"

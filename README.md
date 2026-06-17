@@ -1,122 +1,125 @@
-# VMware Secure Boot Kernel Module Auto-Fix
+# VMware Kernel Module Auto-Fix
 
 **Never manually fix VMware after a kernel update again.**
 
-When a kernel update breaks VMware Workstation on Ubuntu with Secure Boot enabled, this hook automatically:
-1. Recompiles `vmmon` and `vmnet` for the new kernel
-2. Signs them with your MOK key for Secure Boot
-3. Verifies the signatures actually took effect (catches silent failures)
-4. Enables `vmware.service` so it starts on next boot
-5. Clears the "failed" state left by `vmware-modconfig`
+Works on any Debian/Ubuntu system — Secure Boot or not. The hook detects your environment and does the right thing.
+
+## What it does
+
+| Step | With Secure Boot | Without Secure Boot |
+|------|-----------------|---------------------|
+| 1 | Recompiles `vmmon` + `vmnet` for new kernel | Same |
+| 2 | Signs modules with your MOK key | Skipped |
+| 3 | Verifies signatures took effect | Skipped |
+| 4 | Enables `vmware.service` (auto-start on boot) | Same |
+| 5 | Clears stale "failed" state | Same |
 
 ## Quick Start
 
-```bash
-# 1. One-time setup — generate and enroll MOK keys
-sudo mkdir -p /root/.vmware-keys
-sudo openssl req -new -x509 -newkey rsa:2048 -keyout /root/.vmware-keys/MOK.priv \
-  -outform DER -out /root/.vmware-keys/MOK.der -nodes -days 36500 \
-  -subj "/CN=VMware-MOK"
-sudo mokutil --import /root/.vmware-keys/MOK.der
-# Reboot, enroll the key in the MOK Manager, then continue:
+### 1. Generate MOK keys (Secure Boot users only)
 
-# 2. Install the hook
+Skip this if Secure Boot is disabled on your system. Check with `mokutil --sb-state`.
+
+```bash
+sudo mkdir -p /root/.vmware-keys
+sudo openssl req -new -x509 -newkey rsa:2048 \
+  -keyout /root/.vmware-keys/MOK.priv \
+  -outform DER -out /root/.vmware-keys/MOK.der \
+  -nodes -days 36500 -subj "/CN=VMware-MOK"
+sudo mokutil --import /root/.vmware-keys/MOK.der
+# Reboot, select "Enroll MOK" in the blue MOK Manager screen, then continue:
+```
+
+### 2. Install the hook
+
+```bash
 sudo cp vmware-sign-modules /etc/kernel/postinst.d/vmware-sign-modules
 sudo chmod +x /etc/kernel/postinst.d/vmware-sign-modules
+```
 
-# 3. Run it once for the current kernel (optional — hook handles future updates)
+### 3. Run it once for the current kernel (optional)
+
+```bash
 sudo /etc/kernel/postinst.d/vmware-sign-modules $(uname -r)
 ```
 
-That's it. Next time a kernel update arrives, VMware will work after reboot — no manual intervention.
+Done. Next kernel update will be handled automatically.
 
-## Root Cause Analysis
+## Configuration
 
-### The Problem
+Set these environment variables before the hook runs — either at the top of the hook file, or in `/etc/default/vmware-sign-modules`:
 
-On Ubuntu with Secure Boot enabled, VMware Workstation breaks after every kernel update:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MOK_PRIV_DIR` | `/root/.vmware-keys` | Path to MOK key directory |
+| `LOG_FILE` | `/var/log/vmware-hook.log` | Log file location |
+| `MAX_RETRIES` | `3` | Retry attempts for headers/signing |
+| `RETRY_DELAY` | `30` | Seconds between retries |
 
+Example for custom key location:
+```bash
+sudo mkdir -p /etc/default
+echo 'MOK_PRIV_DIR=/etc/vmware-keys' | sudo tee /etc/default/vmware-sign-modules
 ```
-$ systemctl status vmware
-× vmware.service - LSB: This service starts and stops VMware services
-     Active: failed
-   Virtual machine monitor - failed
-   Virtual ethernet - failed
 
-$ dmesg | tail -2
-Loading of unsigned module is rejected
-Loading of unsigned module is rejected
-```
+## Manual Quick-Fix
 
-### Three Interlocking Bugs
-
-This problem is caused by **three compounding issues** that must all be fixed:
-
-#### Bug 1: Wrong-Target Signing
-
-The kernel post-install hook runs during `dpkg --configure`, *before* reboot. The typical approach:
+If VMware is currently broken and you want to fix it right now:
 
 ```bash
-VMMON=$(modinfo -n vmmon)      # ← BUG: finds OLD kernel's module!
-sign-file sha256 key.priv key.der "$VMMON"
+sudo ./fix-vmware.sh
 ```
 
-`modinfo -n` queries the **currently running** kernel's module tree. During kernel installation, that's still the **old** kernel. So the hook signs the old kernel's modules, while `vmware-modconfig` compiles new (unsigned) ones for the new kernel.
-
-**Fix:** Target the new kernel explicitly:
+Or for custom key location:
 ```bash
-MOD_DIR="/lib/modules/${KERNEL_VERSION}/misc"
-sign-file sha256 key.priv key.der "${MOD_DIR}/vmmon.ko"
+sudo MOK_PRIV_DIR=/custom/path ./fix-vmware.sh
 ```
 
-#### Bug 2: Disabled Service
+## Root Cause: Why This Problem Exists
 
-`vmware.service` is often in a `disabled` state. Even after a successful compile + sign, systemd will never auto-start it after reboot:
+Three compounding bugs break VMware after every kernel update on Secure Boot systems:
+
+### Bug 1: Wrong-Target Signing
+
+Kernel hooks run during `dpkg --configure`, *before* reboot. The typical sign attempt uses:
 
 ```bash
-$ systemctl is-enabled vmware
-disabled
+VMMON=$(modinfo -n vmmon)      # ← BUG: returns OLD kernel's module path!
 ```
 
-**Fix:** `systemctl enable vmware` in the hook.
+`modinfo -n` queries the currently running kernel. Since we haven't rebooted yet, that's still the **old** kernel. The hook signs old modules while `vmware-modconfig` compiles new, unsigned ones.
 
-#### Bug 3: Persisted Failed State
+### Bug 2: Disabled Service
 
-`vmware-modconfig --console --install-all` tries to start the service during compilation. Since the new modules can't load into the old kernel, it fails. Systemd marks the service `failed` — and that state persists across reboots. A failed service won't auto-start.
+`vmware.service` is often `disabled`. Systemd won't auto-start a disabled service after reboot, even if modules are ready.
 
-**Fix:** `systemctl reset-failed vmware` in the hook to clear the stale state.
+### Bug 3: Persisted Failed State
 
-### Why "Succeeded" Signing Can Still Fail
+`vmware-modconfig` tries to start the service during compilation. The new modules can't load into the old kernel, so it fails. Systemd marks it `failed` — that state persists across reboots, and a failed service won't auto-start.
 
-You might see this in logs:
+### Why Signing Can Silently Fail
 
-```
-vmmon signed OK
-vmnet signed OK
-```
+Even when logs show `vmmon signed OK`, the signature may not take. This happens when:
 
-But `modinfo vmmon | grep sig_id` returns nothing — the module is unsigned. This happens when:
+- `vmware-modconfig` overwrites the modules after signing
+- The sign tool succeeds on a temp file but the module at the final path isn't updated
 
-- `vmware-modconfig` recompiles modules **after** signing (some init scripts do this)
-- `sign-file` writes to a temp location but the module at the final path is a fresh copy
-- Module paths change between compilation and signing
+**This hook verifies with `modinfo -F sig_id` and exits with error if the signature didn't stick.**
 
-**Fix:** Add a verification step with `modinfo -F sig_id` that exits with error if the signature didn't take.
+## Compatibility
+
+- **VMware Workstation / Player** 17+ (older versions may work)
+- **Debian / Ubuntu** (any distro with `/etc/kernel/postinst.d/`)
+- **Secure Boot** on or off — auto-detected
+- **Any kernel version**
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `vmware-sign-modules` | The kernel post-install hook (install to `/etc/kernel/postinst.d/`) |
-| `fix-vmware.sh` | Manual quick-fix for the current kernel |
+| `vmware-sign-modules` | Kernel post-install hook |
+| `fix-vmware.sh` | Manual one-shot fix |
 | `README.md` | This document |
-
-## Requirements
-
-- VMware Workstation / Player 17+
-- Ubuntu 22.04+ with Secure Boot enabled
-- MOK keypair generated and enrolled in firmware
-- Kernel headers installed (`linux-headers-$(uname -r)`)
 
 ## License
 
