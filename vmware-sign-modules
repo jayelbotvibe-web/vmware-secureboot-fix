@@ -1,0 +1,141 @@
+#!/bin/bash
+# ============================================================
+# VMware Kernel Module Auto-Fix for Secure Boot
+# ============================================================
+# Installs as: /etc/kernel/postinst.d/vmware-sign-modules
+# Runs automatically after every kernel update
+#
+# WHAT THIS SOLVES:
+#   1. Compiles vmmon/vmnet for the NEW kernel
+#   2. Signs them for Secure Boot (MOK key)
+#   3. Verifies signatures actually took effect
+#   4. Ensures vmware.service auto-starts on next boot
+#   5. Clears the failed state left by vmware-modconfig
+
+set -euo pipefail
+
+KERNEL_VERSION="${1:-}"
+MOK_PRIV="/home/niel/.vmware-keys/MOK.priv"
+MOK_DER="/home/niel/.vmware-keys/MOK.der"
+LOG="/var/log/vmware-hook.log"
+MAX_RETRIES=3
+RETRY_DELAY=30
+
+log() { echo "[$(date)] $*" | tee -a "$LOG"; }
+
+# ── Guard ───────────────────────────────────────────────────
+if [[ -z "$KERNEL_VERSION" ]]; then
+    log "ERROR: No kernel version passed. Aborting."
+    exit 1
+fi
+
+HEADER_DIR="/lib/modules/${KERNEL_VERSION}/build"
+SIGN_TOOL="${HEADER_DIR}/scripts/sign-file"
+
+log "========================================"
+log "Kernel ${KERNEL_VERSION} — building VMware modules"
+log "========================================"
+
+# ── Step 1: Wait for kernel headers ─────────────────────────
+for i in $(seq 1 $MAX_RETRIES); do
+    if [[ -d "$HEADER_DIR" ]]; then
+        log "Headers found at $HEADER_DIR"
+        break
+    fi
+    if [[ $i -eq $MAX_RETRIES ]]; then
+        log "ERROR: Headers not ready after ${MAX_RETRIES} attempts."
+        exit 1
+    fi
+    log "Headers not ready yet (attempt $i). Waiting ${RETRY_DELAY}s..."
+    sleep "$RETRY_DELAY"
+done
+
+# ── Step 2: Compile modules ─────────────────────────────────
+# NOTE: vmware-modconfig will try to start/stop the service
+# and FAIL — this is EXPECTED because we're still on the OLD kernel.
+# The modules get compiled regardless.
+log "Compiling modules..."
+if vmware-modconfig --console --install-all >> "$LOG" 2>&1; then
+    log "Compilation OK"
+else
+    log "Compilation had warnings (service start failed on old kernel — expected)"
+fi
+
+# ── Step 3: Sign modules for Secure Boot ────────────────────
+for attempt in $(seq 1 $MAX_RETRIES); do
+    log "Signing attempt $attempt of $MAX_RETRIES..."
+
+    if [[ ! -f "$SIGN_TOOL" ]]; then
+        if [[ $attempt -lt $MAX_RETRIES ]]; then
+            log "sign-file not ready. Waiting ${RETRY_DELAY}s..."
+            sleep "$RETRY_DELAY"
+            continue
+        fi
+        log "ERROR: sign-file not found at $SIGN_TOOL"
+        exit 1
+    fi
+
+    if [[ ! -f "$MOK_PRIV" || ! -f "$MOK_DER" ]]; then
+        log "ERROR: MOK keys missing at /home/niel/.vmware-keys/"
+        exit 1
+    fi
+
+    MOD_DIR="/lib/modules/${KERNEL_VERSION}/misc"
+    VMMON="${MOD_DIR}/vmmon.ko"
+    VMNET="${MOD_DIR}/vmnet.ko"
+
+    all_ok=true
+
+    for mod in "$VMMON" "$VMNET"; do
+        modname=$(basename "$mod" .ko)
+        if [[ -f "$mod" ]]; then
+            if "$SIGN_TOOL" sha256 "$MOK_PRIV" "$MOK_DER" "$mod" >> "$LOG" 2>&1; then
+                log "  ${modname} signed OK"
+            else
+                log "  ${modname} signing FAILED"
+                all_ok=false
+            fi
+        else
+            log "  ${modname} not found at $mod"
+            all_ok=false
+        fi
+    done
+
+    if $all_ok; then
+        log "All modules signed (attempt $attempt)"
+        break
+    elif [[ $attempt -eq $MAX_RETRIES ]]; then
+        log "ERROR: Signing failed after $MAX_RETRIES attempts"
+        exit 1
+    fi
+    sleep "$RETRY_DELAY"
+done
+
+# ── Step 4: VERIFY signatures actually took effect ──────────
+log "Verifying signatures..."
+for mod in "$VMMON" "$VMNET"; do
+    if [[ -f "$mod" ]]; then
+        sig=$(modinfo -F sig_id "$mod" 2>/dev/null)
+        if [[ -n "$sig" ]]; then
+            log "  $(basename $mod): signed ($sig)"
+        else
+            log "  $(basename $mod): STILL UNSIGNED! Signing failed silently."
+            exit 1
+        fi
+    fi
+done
+
+# ── Step 5: Update module dependencies ──────────────────────
+depmod "$KERNEL_VERSION" >> "$LOG" 2>&1 && log "depmod OK"
+
+# ── Step 6: Ensure service starts on next boot ──────────────
+systemctl reset-failed vmware 2>/dev/null || true
+systemctl enable vmware 2>/dev/null || true
+log "Service reset and enabled for next boot"
+
+# ── Step 7: Also enable vmware-usbarbitrator ─────────────────
+systemctl enable vmware-USBArbitrator 2>/dev/null || true
+
+log "========================================"
+log "Done. VMware will start automatically on next boot."
+log "========================================"
