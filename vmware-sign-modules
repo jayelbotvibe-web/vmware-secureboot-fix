@@ -31,13 +31,15 @@ if [[ -z "$KERNEL_VERSION" ]]; then
     exit 1
 fi
 
-if [[ ! -f /usr/bin/vmware-modconfig ]]; then
+if [[ ! -f /usr/bin/vmware ]]; then
     log "VMware not installed. Nothing to do."
     exit 0
 fi
 
 HEADER_DIR="/lib/modules/${KERNEL_VERSION}/build"
 SIGN_TOOL="${HEADER_DIR}/scripts/sign-file"
+MOD_DIR="/lib/modules/${KERNEL_VERSION}/misc"
+MOD_SRC="/usr/lib/vmware/modules/source"
 
 # ── Detect Secure Boot ──────────────────────────────────────
 SECURE_BOOT=0
@@ -66,15 +68,54 @@ for i in $(seq 1 $MAX_RETRIES); do
     sleep "$RETRY_DELAY"
 done
 
-# ── Step 2: Compile modules ─────────────────────────────────
-# vmware-modconfig tries to start the service — this FAILS
-# because we're still on the OLD kernel. Expected and harmless.
-log "Compiling modules..."
-if vmware-modconfig --console --install-all >> "$LOG" 2>&1; then
-    log "Compilation OK"
-else
-    log "Compilation had warnings (service start on old kernel failed — expected)"
-fi
+# ── Step 2: Compile modules against the NEW kernel ──────────
+# CRITICAL: We compile against ${KERNEL_VERSION} (the kernel being
+# installed), NOT the running kernel. vmware-modconfig uses uname -r
+# which is still the OLD kernel during package postinst, so modules
+# would land in the wrong /lib/modules/ tree. We bypass it entirely
+# and use the kernel build system directly.
+log "Compiling modules for kernel ${KERNEL_VERSION}..."
+
+mkdir -p "$MOD_DIR"
+
+for mod in vmmon vmnet; do
+    src_tar="${MOD_SRC}/${mod}.tar"
+
+    if [[ ! -f "$src_tar" ]]; then
+        log "ERROR: ${src_tar} not found — is VMware Workstation installed?"
+        exit 1
+    fi
+
+    workdir=$(mktemp -d /tmp/vmware-build-XXXXXX)
+    tar xf "$src_tar" -C "$workdir"
+
+    # Find the extracted source directory (typically vmmon-only/)
+    mod_src_dir=$(find "$workdir" -maxdepth 2 -name 'Makefile' -printf '%h\n' 2>/dev/null | head -1)
+
+    if [[ -z "$mod_src_dir" ]]; then
+        log "ERROR: Could not find ${mod} source Makefile in tarball"
+        rm -rf "$workdir"
+        exit 1
+    fi
+
+    log "  Building ${mod}..."
+    if make -C "$BUILD_DIR" M="$mod_src_dir" modules >> "$LOG" 2>&1; then
+        if [[ -f "${mod_src_dir}/${mod}.ko" ]]; then
+            cp "${mod_src_dir}/${mod}.ko" "${MOD_DIR}/"
+            log "  ${mod}: compiled and installed OK"
+        else
+            log "ERROR: ${mod}.ko not produced by build"
+            rm -rf "$workdir"
+            exit 1
+        fi
+    else
+        log "ERROR: ${mod} compilation failed (see log for details)"
+        rm -rf "$workdir"
+        exit 1
+    fi
+
+    rm -rf "$workdir"
+done
 
 # ── Step 3: Sign modules (Secure Boot only) ─────────────────
 if [[ $SECURE_BOOT -eq 1 ]]; then
@@ -100,7 +141,6 @@ if [[ $SECURE_BOOT -eq 1 ]]; then
             exit 1
         fi
 
-        MOD_DIR="/lib/modules/${KERNEL_VERSION}/misc"
         all_ok=true
 
         for mod in "${MOD_DIR}/vmmon.ko" "${MOD_DIR}/vmnet.ko"; do
@@ -128,7 +168,7 @@ if [[ $SECURE_BOOT -eq 1 ]]; then
         sleep "$RETRY_DELAY"
     done
 
-    # ── Step 4: VERIFY signatures actually took effect ──────
+    # ── Verify signatures actually took effect ───────────────
     log "Verifying signatures..."
     for mod in "${MOD_DIR}/vmmon.ko" "${MOD_DIR}/vmnet.ko"; do
         if [[ -f "$mod" ]]; then
@@ -145,16 +185,19 @@ else
     log "Secure Boot disabled — skipping module signing"
 fi
 
-# ── Step 5: Update module dependencies ──────────────────────
-depmod "$KERNEL_VERSION" >> "$LOG" 2>&1 && log "depmod OK"
+# ── Step 4: Update module dependencies ──────────────────────
+if depmod "$KERNEL_VERSION" >> "$LOG" 2>&1; then
+    log "depmod OK"
+else
+    log "ERROR: depmod failed for kernel ${KERNEL_VERSION}"
+    exit 1
+fi
 
-# ── Step 6: Ensure service starts on next boot ──────────────
-systemctl reset-failed vmware 2>/dev/null || true
+# ── Step 5: Ensure services start on next boot ──────────────
+systemctl reset-failed vmware vmware-USBArbitrator 2>/dev/null || true
 systemctl enable vmware 2>/dev/null || true
-log "Service reset and enabled for next boot"
-
-# ── Step 7: Also enable vmware-usbarbitrator ─────────────────
 systemctl enable vmware-USBArbitrator 2>/dev/null || true
+log "Services reset and enabled for next boot"
 
 log "========================================"
 log "Done. VMware will start automatically on next boot."

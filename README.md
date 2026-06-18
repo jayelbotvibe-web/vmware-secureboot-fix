@@ -60,9 +60,10 @@ sudo ./fix-vmware.sh
 | Step | Secure Boot ON | Secure Boot OFF |
 |------|:---:|:---:|
 | Detects environment | ✅ `mokutil --sb-state` | ✅ |
-| Recompiles `vmmon` + `vmnet` | ✅ `vmware-modconfig` | ✅ |
+| Compiles `vmmon` + `vmnet` for target kernel | ✅ `make` (kernel build system) | ✅ |
 | Signs modules with MOK key | ✅ `sign-file` | ⏭️ Skipped |
 | Verifies signatures took effect | ✅ `modinfo -F sig_id` | ⏭️ Skipped |
+| Runs `depmod` for new kernel | ✅ | ✅ |
 | Enables `vmware.service` | ✅ `systemctl enable` | ✅ |
 | Clears stale "failed" state | ✅ `systemctl reset-failed` | ✅ |
 
@@ -72,18 +73,16 @@ sudo ./fix-vmware.sh
 
 Why do existing approaches fail? Three compounding issues:
 
-### 🐛 Bug 1: Signing the wrong kernel's modules
+### 🐛 Bug 1: Compiling and signing for the wrong kernel
 
-Kernel hooks run during package installation, *before reboot*. The common signing approach:
+Kernel hooks run during package installation, *before reboot*. Two tools query the running (old) kernel:
 
-```bash
-VMMON=$(modinfo -n vmmon)   # Returns OLD kernel's module path
-sign-file ... "$VMMON"       # Signs the wrong file
-```
+- `vmware-modconfig` calls `uname -r` → compiles `vmmon.ko`/`vmnet.ko` for the OLD kernel → modules land in `/lib/modules/OLD_KERNEL/misc/`
+- `modinfo -n vmmon` returns the OLD kernel's module path → signing targets the wrong file
 
-`modinfo -n` queries the **currently running** kernel. Since the system hasn't rebooted, that's the old kernel. The correct, newly-compiled modules for the new kernel are never signed.
+The hook then looks for modules at `/lib/modules/${NEW_KERNEL}/misc/` — but they were never compiled there.
 
-**Our fix**: targets `/lib/modules/${KERNEL_VERSION}/misc/` explicitly.
+**Our fix**: bypass `vmware-modconfig` entirely. Compile directly against the new kernel's build system with `make -C /lib/modules/${NEW_KERNEL}/build`, then sign the resulting modules at the correct path.
 
 ### 🐛 Bug 2: Disabled service
 
